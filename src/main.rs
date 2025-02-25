@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use chrono::Local;
 use clap::{Arg, Command as ClapCommand};
 use crossterm::{
     event::{self, KeyCode, KeyModifiers},
@@ -27,13 +26,13 @@ struct App {
     delay_info: String,
     error_message: Option<String>,
     selected_tab: usize, // 0: unopt IR, 1: opt IR, 2: delay info
-    revision: u32,
-    session_dir: Option<String>,
     dslx_stdlib_path: Option<String>,
     tests_passed: Option<bool>,
+    test_output: Option<String>,
     entry_points: Vec<String>,
     selected_entry: usize,
     file_path: Option<String>,
+    last_update: Option<String>,
 }
 
 impl App {
@@ -45,13 +44,13 @@ impl App {
             delay_info: String::new(),
             error_message: None,
             selected_tab: 0,
-            revision: 0,
-            session_dir: None,
             dslx_stdlib_path: None,
             tests_passed: None,
+            test_output: None,
             entry_points: Vec::new(),
             selected_entry: 0,
             file_path: None,
+            last_update: None,
         }
     }
 
@@ -72,6 +71,7 @@ impl App {
     }
 
     fn run_conversion(&mut self) {
+        self.tests_passed = Some(false);
         let file_path = self.file_path.clone().expect("file_path not set");
 
         let tools = env::var("XLSYNTH_TOOLS").expect("XLSYNTH_TOOLS not set");
@@ -89,6 +89,7 @@ impl App {
                 "ir_converter_main: {}",
                 String::from_utf8_lossy(&ir_conv_output.stderr)
             ));
+            self.tests_passed = Some(false);
             return;
         }
         self.error_message = None;
@@ -112,6 +113,7 @@ impl App {
                 "opt_main: {}",
                 String::from_utf8_lossy(&opt_output.stderr)
             ));
+            self.tests_passed = Some(false);
             return;
         }
         self.error_message = None;
@@ -133,6 +135,7 @@ impl App {
                 "delay_info_main: {}",
                 String::from_utf8_lossy(&delay_output.stderr)
             ));
+            self.tests_passed = Some(false);
             return;
         }
         self.error_message = None;
@@ -146,11 +149,18 @@ impl App {
             if let Some(ref stdlib) = self.dslx_stdlib_path {
                 interpreter_cmd.arg("--dslx_stdlib_path").arg(stdlib);
             }
+            interpreter_cmd.arg("--compare=jit");
             let interpreter_output = interpreter_cmd
                 .output()
                 .expect("Failed to run dslx_interpreter_main");
             if interpreter_output.status.success() {
                 self.tests_passed = Some(true);
+                let output = if interpreter_output.stdout.is_empty() {
+                    interpreter_output.stderr
+                } else {
+                    interpreter_output.stdout
+                };
+                self.test_output = Some(String::from_utf8_lossy(&output).to_string());
             } else {
                 self.error_message = Some(format!(
                     "dslx_interpreter_main: {}",
@@ -207,11 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
-    )?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -228,9 +234,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         terminal.draw(|f| {
             let size = f.size();
+            let code_line_count = app.code.lines().count() as u16;
+            // Compute top height: content lines + 6, but at least 10 and leaving at least 3 lines for error pane
+            let top_height = std::cmp::min(
+                std::cmp::max(code_line_count + 6, 10),
+                size.height.saturating_sub(3),
+            );
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(80), Constraint::Percentage(20)].as_ref())
+                .constraints([Constraint::Length(top_height), Constraint::Min(3)].as_ref())
                 .split(size);
 
             let horizontal_chunks = Layout::default()
@@ -250,14 +262,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|(i, line)| format!("{:>4} {}", i + 1, line))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let title = if let Some(time) = &app.last_update {
+                format!("updated at {}", time)
+            } else {
+                String::from("File")
+            };
             let code_widget = Paragraph::new(code_with_line_numbers)
-                .block(Block::default().borders(Borders::ALL).title("File"));
+                .block(Block::default().borders(Borders::ALL).title(title));
             f.render_widget(code_widget, left_chunks[0]);
 
-            if let Some(true) = app.tests_passed {
-                let test_status = Paragraph::new("Tests passed")
-                    .style(Style::default().bg(Color::Green).fg(Color::Black))
-                    .block(Block::default().borders(Borders::NONE));
+            if let Some(tests_passed) = app.tests_passed {
+                let test_status = if tests_passed {
+                    Paragraph::new("Tests passed")
+                        .style(Style::default().bg(Color::Green).fg(Color::Black))
+                        .block(Block::default().borders(Borders::NONE))
+                } else {
+                    Paragraph::new("Artifact generation error")
+                        .style(Style::default().bg(Color::Red).fg(Color::Black))
+                        .block(Block::default().borders(Borders::NONE))
+                };
                 f.render_widget(test_status, left_chunks[1]);
             }
 
@@ -322,14 +345,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             f.render_widget(content_widget, results_chunks[2]);
 
             // Error pane always shown at the bottom
-            let error_text = if let Some(error) = &app.error_message {
-                error.clone()
+            let error_widget = if let Some(true) = app.tests_passed {
+                Paragraph::new(
+                    app.test_output
+                        .clone()
+                        .unwrap_or_else(|| String::from("[ no test output ]")),
+                )
+                .block(Block::default().borders(Borders::ALL).title("test output"))
+            } else if let Some(error) = &app.error_message {
+                Paragraph::new(error.clone()).block(Block::default().borders(Borders::ALL).title(
+                    Spans::from(Span::styled("Error", Style::default().fg(Color::Red))),
+                ))
             } else {
-                "[ none ]".to_string()
+                Paragraph::new("[ none ]")
+                    .style(Style::default().fg(Color::Gray))
+                    .block(Block::default().borders(Borders::ALL).title("Error"))
             };
-            let error_widget = Paragraph::new(error_text)
-                .style(Style::default().fg(Color::Gray))
-                .block(Block::default().borders(Borders::ALL).title("Error"));
             f.render_widget(error_widget, chunks[1]);
         })?;
 
@@ -342,6 +373,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 // Reload the file and update the app state
                 app.code = fs::read_to_string(file_path)?;
+                app.last_update =
+                    Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
                 app.check_and_run_conversion();
             }
         }
@@ -383,11 +416,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }
