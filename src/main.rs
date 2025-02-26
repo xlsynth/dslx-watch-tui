@@ -304,13 +304,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Style::default().fg(Color::Yellow),
                 )),
             ];
-            let tabs = Tabs::new(tabs_titles)
-                .select(app.selected_tab)
-                .block(Block::default().borders(Borders::ALL).title("Results"))
-                .highlight_style(Style::default().fg(Color::LightGreen));
-            f.render_widget(tabs, results_chunks[0]);
-
-            // Insert entry point selector widget displaying all entry points
             let entry_spans = Spans::from(
                 app.entry_points
                     .iter()
@@ -332,7 +325,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .borders(Borders::ALL)
                     .title("Entry (use ←/→ to change)"),
             );
-            f.render_widget(entry_widget, results_chunks[1]);
+            f.render_widget(entry_widget, results_chunks[0]);
+
+            let tabs = Tabs::new(tabs_titles)
+                .select(app.selected_tab)
+                .block(Block::default().borders(Borders::ALL).title("Results"))
+                .highlight_style(Style::default().fg(Color::LightGreen));
+            f.render_widget(tabs, results_chunks[1]);
 
             let content = match app.selected_tab {
                 0 => app.unopt_ir.as_str(),
